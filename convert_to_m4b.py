@@ -9,8 +9,9 @@ Usage:
     python3 convert_to_m4b.py -j 4 /path/to/audiobooks
 
 Scans <directory> (default: current dir) for audiobooks stored as:
-  - ZIP archives containing MP3s (with optional bookinfo.html / playlist.pls)
-  - Folder trees whose leaf directories contain MP3 files
+  - ZIP archives containing audio files (with optional bookinfo.html / playlist.pls)
+  - Folder trees whose leaf directories contain audio files
+    (MP3, M4A, OGG, OPUS, WMA, FLAC, WAV, AAC)
   - Folders with .m3u/.m3u8/.pls playlists (used for track ordering)
 
 Outputs to <directory>/m4b/ with filenames like "Author - Title.m4b".
@@ -28,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
@@ -45,6 +47,13 @@ except ImportError:
 AAC_BITRATE = "128k"
 OUTPUT_SUBDIR = "m4b"
 TEMP_SUBDIR = ".tmp"
+AUDIO_EXTENSIONS = {".mp3", ".m4a", ".m4b", ".ogg", ".oga", ".opus",
+                    ".wma", ".flac", ".wav", ".aac"}
+
+
+def is_audio_file(name):
+    """Return True if *name* (str or Path) has a recognised audio extension."""
+    return Path(name).suffix.lower() in AUDIO_EXTENSIONS
 
 # ── tqdm-safe logging ────────────────────────────────────────────────────────
 
@@ -91,8 +100,50 @@ def ffprobe_duration_ms(filepath):
 
 
 def ffprobe_tags(filepath):
-    """Return the format-level tag dict of an audio file."""
-    return ffprobe_json(filepath).get("format", {}).get("tags", {})
+    """Return the format-level tag dict of an audio file (charset-repaired)."""
+    raw = ffprobe_json(filepath).get("format", {}).get("tags", {})
+    return {k: _fix_mojibake(v) if isinstance(v, str) else v
+            for k, v in raw.items()}
+
+
+# Characters that appear in CP1250-as-Latin1 mojibake but are unusual in
+# normal Czech/Slovak UTF-8 text.  If any are present the string is very
+# likely mojibake and we try to recover it via Latin-1 → CP1250.
+# Mappings: ř→ø ů→ù č→è Č→È ě→ì ž→\x9e š→\x9a ň→ò ď→ï ť→\x9d
+_MOJIBAKE_PRINTABLE = set("øùèÈìòþÞ¹©ï»")
+# C1 control characters (0x80-0x9F) — in CP1250 these map to useful chars
+# like š(0x9A), ž(0x9E), ť(0x9D), etc. Their presence in text is a strong
+# signal of CP1250 mojibake since valid UTF-8 never produces bare C1 chars.
+_MOJIBAKE_C1_RANGE = range(0x80, 0xA0)
+
+
+def _looks_like_mojibake(text):
+    """Heuristic: does the text contain CP1250-as-Latin1 artifacts?"""
+    for ch in text:
+        if ch in _MOJIBAKE_PRINTABLE or ord(ch) in _MOJIBAKE_C1_RANGE:
+            return True
+    return False
+
+
+def _fix_mojibake(text):
+    """
+    Detect and repair CP1250-encoded text that was decoded as Latin-1.
+
+    Many older Czech audiobook MP3s have ID3v1 tags encoded in Windows-1250
+    but the tagger (or ffprobe) interprets them as Latin-1, producing
+    garbled diacritics: ř→ø, ů→ù, č→è, ě→ì, ž→\x9E (C1 control), etc.
+    """
+    if not text or not _looks_like_mojibake(text):
+        return text
+    try:
+        # Re-encode as Latin-1 to get the original CP1250 bytes, then decode
+        recovered = text.encode("latin-1").decode("cp1250")
+        # Basic sanity: recovered text should not contain control chars
+        if not any(ord(c) < 32 for c in recovered if c not in "\n\r\t"):
+            return recovered
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        pass
+    return text
 
 
 def file_has_cover_stream(filepath):
@@ -168,9 +219,67 @@ def _normalise_for_compare(s):
     return re.sub(r"[\s\-_.,:;!?]+", " ", s.lower()).strip()
 
 
+def parse_folder_name(name):
+    """
+    Try to extract (author, title) from a folder/file name.
+
+    Recognised patterns (in order):
+      - ``"Author__Title"``         (double underscore — unambiguous)
+      - ``"Author - Title"``        (dash separator — also ``_-_``)
+      - ``"Author, First - Title"`` (comma in author part before the dash)
+      - ``"Author: Title"``         (colon separator)
+
+    Returns ``("", "")`` when no pattern matches.
+    The author is passed through :func:`normalise_author`.
+    Underscores are replaced with spaces in both parts.
+    """
+    name = name.strip()
+
+    # Try "Author__Title" first (double underscore — unambiguous)
+    if "__" in name:
+        parts = name.split("__", 1)
+        a = normalise_author(parts[0].replace("_", " ").strip())
+        t = parts[1].replace("_", " ").strip()
+        return a, t
+
+    # Normalise underscores to spaces for dash/colon patterns
+    normalised = name.replace("_", " ").strip()
+
+    # Try dash separator.  When there are multiple " - " segments, use the
+    # *last* one as the split point so hyphenated surnames like
+    # "Adler - Olsen J. - Složka 64" → author "Adler - Olsen J.", title "Složka 64".
+    # But also handle parenthetical suffixes like "(Bareš)" as part of the title.
+    if " - " in normalised:
+        idx = normalised.rfind(" - ")
+        raw_a = normalised[:idx].strip()
+        raw_t = normalised[idx + 3:].strip()
+        if raw_a and raw_t:
+            a = normalise_author(raw_a)
+            return a, raw_t
+
+    # Try "Author: Title" in name
+    if ": " in normalised:
+        parts = normalised.split(": ", 1)
+        a = normalise_author(parts[0].strip())
+        t = parts[1].strip()
+        if a and t:
+            return a, t
+
+    return "", ""
+
+
+def _is_audiobook_genre(tags):
+    """True if the genre tag indicates an audiobook."""
+    genre = tags.get("genre", "").lower()
+    return any(kw in genre for kw in (
+        "audiobook", "audiokniha", "knihy", "mluvené", "book", "spoken",
+        "povídka", "roman", "próza",
+    ))
+
+
 def extract_book_metadata(tags, folder_name=""):
     """
-    Extract *(author, title)* from MP3 tags.
+    Extract *(author, title)* from audio file tags.
 
     Audiobook tags are notoriously inconsistent — the ``artist`` field may
     hold the author **or** the narrator depending on the provider.  The
@@ -178,7 +287,8 @@ def extract_book_metadata(tags, folder_name=""):
     sometimes embeds the author too (``"Author: Title"``).
 
     *folder_name* (the leaf directory name, stripped of numbering) is used
-    as a title fallback and to validate the ``album`` pattern.
+    as a title fallback, for ``album`` pattern validation, and as a last-
+    resort source of author/title via :func:`parse_folder_name`.
 
     Returns ``(author, title)`` — either may be ``""`` if nothing useful
     was found.
@@ -186,12 +296,14 @@ def extract_book_metadata(tags, folder_name=""):
     album = tags.get("album", "").strip()
     artist = tags.get("artist", "").strip()
     album_artist = tags.get("album_artist", "").strip()
+    composer = tags.get("composer", "").strip()
+    tag_title = tags.get("title", "").strip()
     comment = tags.get("comment", "")
 
     author = ""
     title = album  # default: whole album tag is the title
 
-    # ── Strategy 1: album "Author: Title" pattern ──
+    # ── Strategy 1a: album "Author: Title" pattern ──
     #   e.g. "Filip Rožek: GUMP - Jsme dvojka"
     if ": " in album:
         candidate_author, candidate_title = album.split(": ", 1)
@@ -205,13 +317,22 @@ def extract_book_metadata(tags, folder_name=""):
                 author = candidate_author
                 title = candidate_title
 
-    # ── Strategy 2: narrator in comment → disqualify artist ──
+    # ── Strategy 1b: title tag "Author: Title" pattern ──
+    #   e.g. title = "Vegard Steiro Amundsen: Made in Norway"
+    if not author and not album and ": " in tag_title:
+        candidate_author, candidate_title = tag_title.split(": ", 1)
+        candidate_author = candidate_author.strip()
+        candidate_title = candidate_title.strip()
+        if candidate_author and candidate_title:
+            author = normalise_author(candidate_author)
+            title = candidate_title
+
+    # ── Strategy 2: narrator detection → prefer composer as author ──
     if not author:
         narrator = ""
         m = re.search(r"[Čč]te:\s*(.*)", comment)
         if m:
             narrator = m.group(1).strip()
-        composer = tags.get("composer", "").strip()
 
         if narrator and artist:
             na = _normalise_for_compare(narrator)
@@ -221,16 +342,213 @@ def extract_book_metadata(tags, folder_name=""):
                 author = normalise_author(composer) if composer else ""
             else:
                 author = normalise_author(artist)
+        elif composer and artist and composer != artist:
+            # When composer differs from artist — on audiobooks the composer
+            # is often the book author while artist is the narrator.
+            # Only prefer composer when the genre explicitly says audiobook;
+            # otherwise fall through to the normal artist-first logic, because
+            # many music-tagged audiobooks use artist=author, composer=narrator.
+            if _is_audiobook_genre(tags):
+                author = normalise_author(composer)
+            else:
+                author = normalise_author(artist)
         else:
             # Prefer artist; when empty, try composer before album_artist
             # (album_artist on audiobooks is frequently the narrator)
             raw = artist or composer or album_artist
             author = normalise_author(raw) if raw else ""
 
+    # ── Strategy 3: folder name parsing ──
+    #   When tags are useless (empty, hashes, no metadata), try to extract
+    #   author/title from the folder or parent folder name.
+    if not author and folder_name:
+        fn_author, fn_title = parse_folder_name(folder_name)
+        if fn_author:
+            author = fn_author
+        if fn_title and not title:
+            title = fn_title
+
+    # ── Strategy 3b: folder name *is* an author name ──
+    #   e.g. "Asimov, Isaac" — a "Last, First" pattern with no title part.
+    #   Use it as author and try to derive title from the title tag or filename.
+    if not author and folder_name and "," in folder_name:
+        parts = folder_name.split(",", 1)
+        if len(parts) == 2 and parts[1].strip():
+            # Looks like "Last, First" — use as author
+            author = normalise_author(folder_name)
+            # Try to extract a title from the title tag (strip the author
+            # name and generic words like "AUDIOKNIHA")
+            if tag_title and not title:
+                # Strip author name variants from the title tag
+                t = tag_title
+                for pattern in [
+                    re.escape(author), re.escape(folder_name),
+                    re.escape(artist), re.escape(folder_name.replace(",", "")),
+                ]:
+                    if pattern:
+                        t = re.sub(pattern, "", t, flags=re.IGNORECASE).strip()
+                t = re.sub(r"(?i)\baudiokniha\b", "", t).strip(" .,;:-")
+                if t:
+                    title = t
+
     # ── Title fallback ──
+    # If the tag-derived title looks like a radio station abbreviation
+    # (very short, mostly uppercase) and the folder name is more
+    # descriptive, prefer the folder name.
     if not title:
         title = folder_name
+    elif (folder_name and len(title) <= 4
+          and sum(1 for c in title if c.isupper()) >= len(title) // 2
+          and len(folder_name) > len(title) * 2):
+        title = folder_name
 
+    return author, title
+
+
+# ── AI-assisted metadata extraction ──────────────────────────────────────────
+
+_CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+_CLAUDE_MODEL = "claude-haiku-4-20250414"
+
+# Module-level API key — set by main() from CLI args / env var.
+_claude_api_key = None
+_claude_api_warned = False
+
+
+def _call_claude(prompt, api_key):
+    """
+    Send a single prompt to the Claude API. Returns the text response
+    or ``""`` on any failure.  Uses only stdlib (urllib).
+    """
+    payload = json.dumps({
+        "model": _CLAUDE_MODEL,
+        "max_tokens": 256,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode()
+
+    req = urllib.request.Request(
+        _CLAUDE_API_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            body = json.loads(resp.read())
+            return body["content"][0]["text"]
+    except urllib.error.HTTPError as e:
+        global _claude_api_warned
+        if not _claude_api_warned:
+            try:
+                err = json.loads(e.read()).get("error", {}).get("message", "")
+            except Exception:
+                err = str(e)
+            log(f"  WARNING: Claude API error: {err}")
+            log("  Falling back to heuristic metadata extraction.")
+            _claude_api_warned = True
+        return ""
+    except Exception:
+        return ""
+
+
+def ai_extract_metadata(tags, folder_name="", parent_name="",
+                         filenames=None, api_key=None):
+    """
+    Use Claude to determine the book **author** and **title** from the
+    available signals.  Returns ``(author, title)`` or ``("", "")`` on
+    failure, so the caller can fall back to heuristic extraction.
+    """
+    if not api_key:
+        return "", ""
+
+    # Build a concise context block with everything we know.
+    parts = []
+    if tags:
+        # Only include useful tags, skip binary / internal ones.
+        useful = {k: v for k, v in tags.items()
+                  if k.lower() in (
+                      "title", "album", "artist", "album_artist", "composer",
+                      "genre", "comment", "performer", "date", "encoded_by",
+                      "TSOC", "artist-sort", "TSO2",
+                  ) and v and v.strip()}
+        if useful:
+            parts.append("Audio file tags:\n" + "\n".join(
+                f"  {k}: {v}" for k, v in useful.items()))
+    if folder_name:
+        parts.append(f"Folder name (leaf): {folder_name}")
+    if parent_name:
+        parts.append(f"Parent folder: {parent_name}")
+    if filenames:
+        sample = filenames[:5]
+        parts.append("Audio filenames (first 5):\n" + "\n".join(
+            f"  {f}" for f in sample))
+        if len(filenames) > 5:
+            parts.append(f"  ... ({len(filenames)} files total)")
+
+    if not parts:
+        return "", ""
+
+    context = "\n".join(parts)
+
+    prompt = f"""You are extracting metadata from an audiobook. Given the information below, determine the book's AUTHOR (the person who wrote the book) and TITLE.
+
+IMPORTANT:
+- The "artist" tag is often the NARRATOR (the person reading aloud), not the author. Use "composer", "album", folder names, and other clues to distinguish.
+- Folder names on the server often follow "Author, Last - Title" or "Author__Title" patterns.
+- Tags may have encoding issues (mojibake) — try to infer the correct text.
+- The album tag is usually the book title.
+- Return the author as "Firstname Lastname" (not "Lastname, Firstname").
+
+{context}
+
+Respond with ONLY a JSON object, no other text:
+{{"author": "...", "title": "..."}}"""
+
+    text = _call_claude(prompt, api_key)
+    if not text:
+        return "", ""
+
+    # Parse the JSON from the response — be lenient.
+    try:
+        # Strip markdown code fences if present
+        text = text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```\w*\n?", "", text)
+            text = re.sub(r"\n?```$", "", text)
+        data = json.loads(text.strip())
+        author = data.get("author", "").strip()
+        title = data.get("title", "").strip()
+        return author, title
+    except (json.JSONDecodeError, AttributeError):
+        return "", ""
+
+
+def smart_extract_metadata(tags, folder_name="", parent_name="",
+                           filenames=None):
+    """
+    Extract (author, title) using AI when available, falling back to
+    heuristic extraction.
+    """
+    # Try AI first
+    if _claude_api_key:
+        ai_author, ai_title = ai_extract_metadata(
+            tags, folder_name=folder_name, parent_name=parent_name,
+            filenames=filenames, api_key=_claude_api_key,
+        )
+        if ai_author or ai_title:
+            return ai_author, ai_title
+
+    # Heuristic fallback
+    author, title = extract_book_metadata(tags, folder_name=folder_name)
+    if not author and parent_name:
+        # Try parent folder as author (same logic as _author_from_parent)
+        if "," in parent_name:
+            author = normalise_author(parent_name)
     return author, title
 
 
@@ -473,8 +791,9 @@ def build_ffmetadata(chapters, meta):
 
 def convert_to_m4b(mp3_files, chapters, metadata, cover_path, output_path, temp_dir):
     """
-    Merge *mp3_files* into a single M4B at *output_path*.
+    Merge audio files (*mp3_files*) into a single M4B at *output_path*.
 
+    Accepts any audio format that ffmpeg can decode (MP3, M4A, OGG, etc.).
     Returns True on success.
     """
     # concat demuxer file list
@@ -552,12 +871,12 @@ def discover_books(base_dir):
         if f.is_file() and f.suffix.lower() == ".zip":
             books.append(("zip", f))
 
-    # folder books — leaf directories that contain mp3 files
+    # folder books — leaf directories that contain audio files
     for root, dirs, files in os.walk(base_dir):
         dirs[:] = sorted(d for d in dirs if d not in skip)
         rp = Path(root)
-        mp3s = [f for f in files if f.lower().endswith(".mp3")]
-        if mp3s:
+        audio = [f for f in files if is_audio_file(f)]
+        if audio:
             books.append(("folder", rp))
             dirs.clear()  # don't descend further
 
@@ -580,7 +899,7 @@ def plan_zip_book(zip_path, output_dir):
     try:
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
-            n_tracks = sum(1 for n in names if n.lower().endswith(".mp3"))
+            n_tracks = sum(1 for n in names if is_audio_file(n))
 
             for n in names:
                 if os.path.basename(n).lower() == "bookinfo.html":
@@ -608,20 +927,57 @@ def plan_zip_book(zip_path, output_dir):
     }
 
 
+def _author_from_parent(folder_path, base_dir):
+    """
+    If the folder sits inside an author-named parent directory, try to
+    extract the author name from the parent.  Returns ``""`` on failure.
+
+    Handles patterns like ``Backman, Frederik / Muz jmenem Ove`` where
+    the parent folder is ``"Backman, Frederik"`` (i.e. ``Last, First``).
+    """
+    try:
+        rel = folder_path.relative_to(base_dir)
+    except ValueError:
+        return ""
+    parts = rel.parts
+    if len(parts) < 2:
+        return ""
+    parent_name = parts[-2]  # immediate parent relative to base
+    # Accept "Last, First" pattern as likely an author name
+    if "," in parent_name:
+        return normalise_author(parent_name)
+    return ""
+
+
+def _parent_folder_name(folder_path, base_dir):
+    """Return the immediate parent folder name relative to base_dir, or ''."""
+    try:
+        parts = folder_path.relative_to(base_dir).parts
+    except ValueError:
+        return ""
+    return parts[-2] if len(parts) >= 2 else ""
+
+
 def plan_folder_book(folder_path, base_dir, output_dir):
     """
     Cheaply determine output name, track count, and skip/convert status
-    for a folder audiobook.  Metadata comes from MP3 tags; the leaf
+    for a folder audiobook.  Metadata comes from audio file tags; the leaf
     folder name is only used as a title fallback.
     """
     rel = folder_path.relative_to(base_dir)
-    mp3_files = sorted(folder_path.glob("*.mp3"))
-    n_tracks = len(mp3_files)
+    audio_files = sorted(f for f in folder_path.iterdir()
+                         if f.is_file() and is_audio_file(f.name))
+    n_tracks = len(audio_files)
     folder_name = strip_number_prefix(folder_path.name) or folder_path.name
+    parent_name = _parent_folder_name(folder_path, base_dir)
 
-    if mp3_files:
-        tags = ffprobe_tags(mp3_files[0])
-        author, title = extract_book_metadata(tags, folder_name=folder_name)
+    if audio_files:
+        tags = ffprobe_tags(audio_files[0])
+        filenames = [f.name for f in audio_files]
+        author, title = smart_extract_metadata(
+            tags, folder_name=folder_name, parent_name=parent_name,
+            filenames=filenames,
+        )
     else:
         author, title = "", folder_name
 
@@ -781,12 +1137,12 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
         if candidates:
             return candidates[0]
 
-    # 2 – largest image file sitting next to the MP3s
+    # 2 – largest image file sitting next to the audio files
     img = find_largest_image(directory)
     if img:
         return img
 
-    # 3 – extract from the first MP3 with an embedded cover
+    # 3 – extract from the first audio file with an embedded cover
     for mp3 in mp3_files[:3]:
         if file_has_cover_stream(mp3):
             out = directory / ".cover_extracted.jpg"
@@ -852,41 +1208,47 @@ def process_zip(zip_path, output_dir, temp_base):
             extract_dir.mkdir(parents=True, exist_ok=True)
             zf.extractall(extract_dir)
 
-        # ── order MP3 files ──
-        all_mp3s = sorted(extract_dir.rglob("*.mp3"))
-        mp3_by_name = {p.name: p for p in all_mp3s}
+        # ── order audio files ──
+        all_audio = sorted(f for f in extract_dir.rglob("*")
+                           if f.is_file() and is_audio_file(f.name))
+        audio_by_name = {p.name: p for p in all_audio}
 
         mp3_files = None
 
         # try bookinfo chapter order first
         if info and info.chapters:
-            ordered = [mp3_by_name[ch["filename"]]
+            ordered = [audio_by_name[ch["filename"]]
                        for ch in info.chapters
-                       if ch.get("filename") in mp3_by_name]
+                       if ch.get("filename") in audio_by_name]
             if ordered:
                 mp3_files = ordered
 
         # then playlist order
         if not mp3_files and playlist_entries:
-            ordered = [mp3_by_name[e["file"]]
+            ordered = [audio_by_name[e["file"]]
                        for e in playlist_entries
-                       if e.get("file") in mp3_by_name]
+                       if e.get("file") in audio_by_name]
             if ordered:
                 mp3_files = ordered
 
-        # fallback: sorted glob
+        # fallback: sorted list
         if not mp3_files:
-            mp3_files = all_mp3s
+            mp3_files = all_audio
 
         if not mp3_files:
-            log("  WARNING: no MP3 files found — skipping")
+            log("  WARNING: no audio files found — skipping")
             return "skip"
 
-        # ── fallback author from tags ──
+        # ── fallback author from tags (or AI) ──
         if not author:
             tags = ffprobe_tags(mp3_files[0])
-            tag_author, _ = extract_book_metadata(tags, folder_name=title)
+            filenames = [f.name for f in mp3_files]
+            tag_author, tag_title = smart_extract_metadata(
+                tags, folder_name=title, filenames=filenames,
+            )
             author = tag_author
+            if not title and tag_title:
+                title = tag_title
         if not author:
             author = "Unknown"
         else:
@@ -950,25 +1312,31 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
     rel = folder_path.relative_to(base_dir)
     log(f"  Folder: {rel}")
 
-    mp3_files = sorted(folder_path.glob("*.mp3"))
+    mp3_files = sorted(f for f in folder_path.iterdir()
+                       if f.is_file() and is_audio_file(f.name))
     if not mp3_files:
-        log("  WARNING: no MP3 files — skipping")
+        log("  WARNING: no audio files — skipping")
         return "skip"
 
     # ── check for a playlist and reorder if found ──
     playlist_entries = find_and_parse_playlist(folder_path)
     if playlist_entries:
-        mp3_by_name = {p.name: p for p in mp3_files}
-        ordered = [mp3_by_name[e["file"]]
+        audio_by_name = {p.name: p for p in mp3_files}
+        ordered = [audio_by_name[e["file"]]
                    for e in playlist_entries
-                   if e.get("file") in mp3_by_name]
+                   if e.get("file") in audio_by_name]
         if ordered:
             mp3_files = ordered
 
     # ── determine author + title from tags ──
     folder_name = strip_number_prefix(folder_path.name) or folder_path.name
+    parent_name = _parent_folder_name(folder_path, base_dir)
     tags = ffprobe_tags(mp3_files[0])
-    author, title = extract_book_metadata(tags, folder_name=folder_name)
+    filenames = [f.name for f in mp3_files]
+    author, title = smart_extract_metadata(
+        tags, folder_name=folder_name, parent_name=parent_name,
+        filenames=filenames,
+    )
     if not author:
         author = "Unknown"
     if not title:
@@ -1066,12 +1434,21 @@ def main():
         "-n", "--dry-run", action="store_true",
         help="Show what would be converted, then exit",
     )
+    ap.add_argument(
+        "--claude-api-key",
+        default=os.environ.get("CLAUDE_API_KEY", ""),
+        help="Anthropic API key for AI-assisted metadata extraction "
+             "(or set CLAUDE_API_KEY env var)",
+    )
     args = ap.parse_args()
+
+    global _claude_api_key
 
     base_dir = Path(args.directory).resolve()
     output_dir = base_dir / OUTPUT_SUBDIR
     temp_base = base_dir / TEMP_SUBDIR
     jobs = max(1, args.jobs)
+    _claude_api_key = args.claude_api_key or None
 
     # preflight
     for tool in ("ffmpeg", "ffprobe"):
@@ -1081,6 +1458,8 @@ def main():
 
     print(f"Source:  {base_dir}")
     print(f"Output:  {output_dir}")
+    if _claude_api_key:
+        print(f"AI:      enabled (claude-haiku-4)")
     if not args.dry_run:
         print(f"Jobs:    {jobs}")
 

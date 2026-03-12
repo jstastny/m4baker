@@ -1,6 +1,12 @@
 *.mp3
-*.zip
+*.m4a
 *.m4b
+*.ogg
+*.flac
+*.wma
+*.wav
+*.aac
+*.zip
 *.jpg
 *.jpeg
 *.png
@@ -8,6 +14,8 @@
 .venv/
 __pycache__/
 m4b/
+alpha-sample/
+claude-api-key
 
 # Keep the code, ignore the audiobooks
 !convert_to_m4b.py
