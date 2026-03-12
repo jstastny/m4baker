@@ -8,4 +8,5 @@ RUN apt-get update && \
 COPY convert_to_m4b.py /app/convert_to_m4b.py
 
 WORKDIR /data
-ENTRYPOINT ["python3", "/app/convert_to_m4b.py", "/data"]
+ENTRYPOINT ["python3", "/app/convert_to_m4b.py"]
+CMD ["/data"]
