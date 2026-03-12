@@ -5,6 +5,8 @@
 *.jpeg
 *.png
 .tmp/
+.venv/
+__pycache__/
 m4b/
 
 # Keep the code, ignore the audiobooks

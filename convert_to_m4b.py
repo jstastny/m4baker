@@ -163,6 +163,77 @@ def normalise_author(raw):
     return raw
 
 
+def _normalise_for_compare(s):
+    """Lower-case, collapse whitespace/punctuation for fuzzy title comparison."""
+    return re.sub(r"[\s\-_.,:;!?]+", " ", s.lower()).strip()
+
+
+def extract_book_metadata(tags, folder_name=""):
+    """
+    Extract *(author, title)* from MP3 tags.
+
+    Audiobook tags are notoriously inconsistent — the ``artist`` field may
+    hold the author **or** the narrator depending on the provider.  The
+    ``album`` field is typically the best source for the book title, but
+    sometimes embeds the author too (``"Author: Title"``).
+
+    *folder_name* (the leaf directory name, stripped of numbering) is used
+    as a title fallback and to validate the ``album`` pattern.
+
+    Returns ``(author, title)`` — either may be ``""`` if nothing useful
+    was found.
+    """
+    album = tags.get("album", "").strip()
+    artist = tags.get("artist", "").strip()
+    album_artist = tags.get("album_artist", "").strip()
+    comment = tags.get("comment", "")
+
+    author = ""
+    title = album  # default: whole album tag is the title
+
+    # ── Strategy 1: album "Author: Title" pattern ──
+    #   e.g. "Filip Rožek: GUMP - Jsme dvojka"
+    if ": " in album:
+        candidate_author, candidate_title = album.split(": ", 1)
+        candidate_author = candidate_author.strip()
+        candidate_title = candidate_title.strip()
+        if candidate_author and candidate_title and folder_name:
+            ct = _normalise_for_compare(candidate_title)
+            fn = _normalise_for_compare(folder_name)
+            min_len = min(len(ct), len(fn), 8)
+            if min_len and ct[:min_len] == fn[:min_len]:
+                author = candidate_author
+                title = candidate_title
+
+    # ── Strategy 2: narrator in comment → disqualify artist ──
+    if not author:
+        narrator = ""
+        m = re.search(r"[Čč]te:\s*(.*)", comment)
+        if m:
+            narrator = m.group(1).strip()
+        composer = tags.get("composer", "").strip()
+
+        if narrator and artist:
+            na = _normalise_for_compare(narrator)
+            ar = _normalise_for_compare(artist)
+            if na == ar:
+                # artist IS the narrator — try composer instead
+                author = normalise_author(composer) if composer else ""
+            else:
+                author = normalise_author(artist)
+        else:
+            # Prefer artist; when empty, try composer before album_artist
+            # (album_artist on audiobooks is frequently the narrator)
+            raw = artist or composer or album_artist
+            author = normalise_author(raw) if raw else ""
+
+    # ── Title fallback ──
+    if not title:
+        title = folder_name
+
+    return author, title
+
+
 # ── playlist parsing ─────────────────────────────────────────────────────────
 
 
@@ -540,40 +611,24 @@ def plan_zip_book(zip_path, output_dir):
 def plan_folder_book(folder_path, base_dir, output_dir):
     """
     Cheaply determine output name, track count, and skip/convert status
-    for a folder audiobook.
+    for a folder audiobook.  Metadata comes from MP3 tags; the leaf
+    folder name is only used as a title fallback.
     """
     rel = folder_path.relative_to(base_dir)
-    parts = list(rel.parts)
     mp3_files = sorted(folder_path.glob("*.mp3"))
     n_tracks = len(mp3_files)
+    folder_name = strip_number_prefix(folder_path.name) or folder_path.name
 
-    author = ""
-    title = ""
-
-    if len(parts) >= 3:
-        author = parts[0]
-        series = strip_number_prefix(parts[1])
-        book = strip_number_prefix(parts[2])
-        num = extract_number_prefix(parts[2])
-        if num is not None:
-            title = f"{series} {num:02d} - {book}"
-        else:
-            title = f"{series} - {book}"
-    elif len(parts) == 2:
-        author = parts[0]
-        title = strip_number_prefix(parts[1])
-    elif len(parts) == 1:
-        title = strip_number_prefix(parts[0]) or parts[0]
-    else:
-        title = folder_path.name
-
-    if not author and mp3_files:
+    if mp3_files:
         tags = ffprobe_tags(mp3_files[0])
-        author = normalise_author(
-            tags.get("artist") or tags.get("album_artist") or ""
-        )
+        author, title = extract_book_metadata(tags, folder_name=folder_name)
+    else:
+        author, title = "", folder_name
+
     if not author:
         author = "Unknown"
+    if not title:
+        title = folder_name
 
     output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
     output_path = output_dir / output_name
@@ -830,9 +885,8 @@ def process_zip(zip_path, output_dir, temp_base):
         # ── fallback author from tags ──
         if not author:
             tags = ffprobe_tags(mp3_files[0])
-            author = normalise_author(
-                tags.get("artist") or tags.get("album_artist") or ""
-            )
+            tag_author, _ = extract_book_metadata(tags, folder_name=title)
+            author = tag_author
         if not author:
             author = "Unknown"
         else:
@@ -896,7 +950,6 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
     rel = folder_path.relative_to(base_dir)
     log(f"  Folder: {rel}")
 
-    parts = list(rel.parts)
     mp3_files = sorted(folder_path.glob("*.mp3"))
     if not mp3_files:
         log("  WARNING: no MP3 files — skipping")
@@ -912,34 +965,14 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
         if ordered:
             mp3_files = ordered
 
-    # ── determine author + title from folder structure ──
-    author = ""
-    title = ""
-
-    if len(parts) >= 3:
-        author = parts[0]
-        series = strip_number_prefix(parts[1])
-        book = strip_number_prefix(parts[2])
-        num = extract_number_prefix(parts[2])
-        if num is not None:
-            title = f"{series} {num:02d} - {book}"
-        else:
-            title = f"{series} - {book}"
-    elif len(parts) == 2:
-        author = parts[0]
-        title = strip_number_prefix(parts[1])
-    elif len(parts) == 1:
-        title = strip_number_prefix(parts[0]) or parts[0]
-    else:
-        title = folder_path.name
-
-    if not author:
-        tags = ffprobe_tags(mp3_files[0])
-        author = normalise_author(
-            tags.get("artist") or tags.get("album_artist") or ""
-        )
+    # ── determine author + title from tags ──
+    folder_name = strip_number_prefix(folder_path.name) or folder_path.name
+    tags = ffprobe_tags(mp3_files[0])
+    author, title = extract_book_metadata(tags, folder_name=folder_name)
     if not author:
         author = "Unknown"
+    if not title:
+        title = folder_name
 
     output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
     output_path = output_dir / output_name
@@ -969,7 +1002,6 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
             chapters.append({"title": t, "duration_ms": dur})
 
         # ── cover ──
-        tags = ffprobe_tags(mp3_files[0])
         isbn = tags.get("ISBN", "")
         cover_path = resolve_cover(
             folder_path, mp3_files,
