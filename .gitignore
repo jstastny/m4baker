@@ -1,0 +1,14 @@
+*.mp3
+*.zip
+*.m4b
+*.jpg
+*.jpeg
+*.png
+.tmp/
+m4b/
+
+# Keep the code, ignore the audiobooks
+!convert_to_m4b.py
+!Dockerfile
+!.gitignore
+!README.md
