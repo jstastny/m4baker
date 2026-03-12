@@ -1,6 +1,20 @@
-# spoken
+# m4baker
 
 Convert audiobook collections (MP3 folders / ZIP archives) to M4B files with chapters, metadata, and cover art.
+
+## Quick start
+
+```bash
+docker run --rm -v /path/to/audiobooks:/data jstastny/m4baker
+```
+
+Output goes to `/path/to/audiobooks/m4b/` with filenames like `Author - Title.m4b`.
+
+Process multiple books in parallel:
+
+```bash
+docker run --rm -v /path/to/audiobooks:/data jstastny/m4baker -j 4
+```
 
 ## Features
 
@@ -10,30 +24,6 @@ Convert audiobook collections (MP3 folders / ZIP archives) to M4B files with cha
 - Embeds chapter markers, cover art, and metadata (author, title, narrator)
 - Reentrant — already converted books are skipped on re-run
 - Parallel processing with `-j`
-
-## Requirements
-
-- Python 3.10+
-- ffmpeg / ffprobe
-
-No pip dependencies.
-
-## Usage
-
-```bash
-python3 convert_to_m4b.py /path/to/audiobooks
-python3 convert_to_m4b.py -j 4 /path/to/audiobooks
-```
-
-Output goes to `/path/to/audiobooks/m4b/` with filenames like `Author - Title.m4b`.
-
-## Docker
-
-```bash
-docker build -t audiobook-m4b .
-docker run --rm -v /path/to/audiobooks:/data audiobook-m4b
-docker run --rm -v /path/to/audiobooks:/data audiobook-m4b -j 4
-```
 
 ## Supported input layouts
 
@@ -50,3 +40,19 @@ audiobooks/
 ```
 
 The script detects the folder depth and derives author, series, and book title accordingly.
+
+## Running without Docker
+
+Requires Python 3.10+ and ffmpeg/ffprobe. No pip dependencies.
+
+```bash
+python3 convert_to_m4b.py /path/to/audiobooks
+python3 convert_to_m4b.py -j 4 /path/to/audiobooks
+```
+
+## Building the Docker image locally
+
+```bash
+docker build -t m4baker .
+docker run --rm -v /path/to/audiobooks:/data m4baker
+```
