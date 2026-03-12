@@ -408,7 +408,12 @@ def extract_book_metadata(tags, folder_name=""):
 # ── AI-assisted metadata extraction ──────────────────────────────────────────
 
 _CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
-_CLAUDE_MODEL = "claude-haiku-4-20250414"
+# Default models to try, cheapest first.  The first model that responds
+# successfully is used for all subsequent calls.  Haiku is ~12x cheaper
+# than Sonnet but may not be available on all account tiers.
+_CLAUDE_DEFAULT_MODELS = ["claude-haiku-4-5-20251001", "claude-sonnet-4-20250514"]
+_claude_models_to_try = list(_CLAUDE_DEFAULT_MODELS)
+_claude_model = None  # resolved on first successful call
 
 # Module-level API key — set by main() from CLI args / env var.
 _claude_api_key = None
@@ -419,41 +424,63 @@ def _call_claude(prompt, api_key):
     """
     Send a single prompt to the Claude API. Returns the text response
     or ``""`` on any failure.  Uses only stdlib (urllib).
+
+    On the first call, tries models from :data:`_CLAUDE_MODELS` in order
+    (cheapest first) and remembers which one works.
     """
-    payload = json.dumps({
-        "model": _CLAUDE_MODEL,
-        "max_tokens": 256,
-        "messages": [{"role": "user", "content": prompt}],
-    }).encode()
+    global _claude_model, _claude_api_warned
 
-    req = urllib.request.Request(
-        _CLAUDE_API_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-        method="POST",
-    )
+    models_to_try = [_claude_model] if _claude_model else _claude_models_to_try
 
-    try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            body = json.loads(resp.read())
-            return body["content"][0]["text"]
-    except urllib.error.HTTPError as e:
-        global _claude_api_warned
-        if not _claude_api_warned:
+    for model in models_to_try:
+        payload = json.dumps({
+            "model": model,
+            "max_tokens": 256,
+            "messages": [{"role": "user", "content": prompt}],
+        }).encode()
+
+        req = urllib.request.Request(
+            _CLAUDE_API_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                body = json.loads(resp.read())
+                if not _claude_model:
+                    _claude_model = model
+                    log(f"  AI model: {model}")
+                return body["content"][0]["text"]
+        except urllib.error.HTTPError as e:
             try:
-                err = json.loads(e.read()).get("error", {}).get("message", "")
+                err_body = json.loads(e.read())
+                err_msg = err_body.get("error", {}).get("message", "")
+                err_type = err_body.get("error", {}).get("type", "")
             except Exception:
-                err = str(e)
-            log(f"  WARNING: Claude API error: {err}")
-            log("  Falling back to heuristic metadata extraction.")
-            _claude_api_warned = True
-        return ""
-    except Exception:
-        return ""
+                err_msg, err_type = str(e), ""
+            # "not_found_error" means the model isn't available on this
+            # tier — try the next one.
+            if err_type == "not_found_error" and not _claude_model:
+                continue
+            if not _claude_api_warned:
+                log(f"  WARNING: Claude API error: {err_msg}")
+                log("  Falling back to heuristic metadata extraction.")
+                _claude_api_warned = True
+            return ""
+        except Exception:
+            return ""
+
+    if not _claude_api_warned:
+        log("  WARNING: No Claude model available on this account tier.")
+        log("  Falling back to heuristic metadata extraction.")
+        _claude_api_warned = True
+    return ""
 
 
 def ai_extract_metadata(tags, folder_name="", parent_name="",
@@ -495,7 +522,7 @@ def ai_extract_metadata(tags, folder_name="", parent_name="",
 
     context = "\n".join(parts)
 
-    prompt = f"""You are extracting metadata from an audiobook. Given the information below, determine the book's AUTHOR (the person who wrote the book) and TITLE.
+    prompt = f"""You are extracting metadata from a Czech audiobook. Given the information below, determine the book's AUTHOR (the person who wrote the book) and TITLE.
 
 IMPORTANT:
 - The "artist" tag is often the NARRATOR (the person reading aloud), not the author. Use "composer", "album", folder names, and other clues to distinguish.
@@ -503,6 +530,8 @@ IMPORTANT:
 - Tags may have encoding issues (mojibake) — try to infer the correct text.
 - The album tag is usually the book title.
 - Return the author as "Firstname Lastname" (not "Lastname, Firstname").
+- KEEP THE TITLE IN ITS ORIGINAL LANGUAGE (usually Czech). Do NOT translate titles to English.
+- Use proper Czech diacritics in titles (e.g. "Mechanický pomeranč" not "Mechanicky pomeranc").
 
 {context}
 
@@ -1440,15 +1469,25 @@ def main():
         help="Anthropic API key for AI-assisted metadata extraction "
              "(or set CLAUDE_API_KEY env var)",
     )
+    ap.add_argument(
+        "--claude-model",
+        default=os.environ.get("CLAUDE_MODEL", ""),
+        help="Claude model to use (default: tries cheapest first: "
+             + ", ".join(_CLAUDE_DEFAULT_MODELS) + ")",
+    )
     args = ap.parse_args()
 
-    global _claude_api_key
+    global _claude_api_key, _claude_models_to_try, _claude_model
 
     base_dir = Path(args.directory).resolve()
     output_dir = base_dir / OUTPUT_SUBDIR
     temp_base = base_dir / TEMP_SUBDIR
     jobs = max(1, args.jobs)
     _claude_api_key = args.claude_api_key or None
+    if args.claude_model:
+        # User specified a model — use only that one, skip auto-detection
+        _claude_models_to_try = [args.claude_model]
+        _claude_model = args.claude_model
 
     # preflight
     for tool in ("ffmpeg", "ffprobe"):
@@ -1459,7 +1498,7 @@ def main():
     print(f"Source:  {base_dir}")
     print(f"Output:  {output_dir}")
     if _claude_api_key:
-        print(f"AI:      enabled (claude-haiku-4)")
+        print(f"AI:      enabled")
     if not args.dry_run:
         print(f"Jobs:    {jobs}")
 
