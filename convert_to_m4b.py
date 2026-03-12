@@ -26,6 +26,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
@@ -462,10 +464,85 @@ def discover_books(base_dir):
     return books
 
 
+# ── online cover lookup ───────────────────────────────────────────────────────
+
+# Minimum image size in bytes to accept (rejects 1x1 pixel placeholders etc.)
+_MIN_COVER_BYTES = 1000
+_HTTP_TIMEOUT = 15
+
+
+def _download_url(url, output_path):
+    """Download *url* to *output_path*.  Return True on success."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "m4baker/1.0"})
+        resp = urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
+        data = resp.read()
+        if len(data) < _MIN_COVER_BYTES:
+            return False
+        with open(output_path, "wb") as fh:
+            fh.write(data)
+        return True
+    except Exception:
+        return False
+
+
+def fetch_cover_google_books(title, author, output_path):
+    """
+    Search Google Books by title + author and download the best cover.
+    Returns True on success.
+    """
+    try:
+        q = f"{title} {author}" if author else title
+        params = urllib.parse.urlencode({"q": q, "maxResults": "5"})
+        url = f"https://www.googleapis.com/books/v1/volumes?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "m4baker/1.0"})
+        resp = urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT)
+        data = json.loads(resp.read())
+
+        for item in data.get("items", []):
+            links = item.get("volumeInfo", {}).get("imageLinks", {})
+            thumb = links.get("thumbnail") or links.get("smallThumbnail")
+            if not thumb:
+                continue
+            # request highest available zoom
+            img_url = re.sub(r"zoom=\d", "zoom=4", thumb)
+            if _download_url(img_url, output_path):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def fetch_cover_openlibrary(isbn, output_path):
+    """
+    Try to fetch a cover image from Open Library by ISBN.
+    Returns True on success.
+    """
+    if not isbn:
+        return False
+    url = f"https://covers.openlibrary.org/b/isbn/{isbn}-L.jpg"
+    return _download_url(url, output_path)
+
+
+def fetch_cover_online(title, author, output_path, isbn=None):
+    """
+    Try to find a cover image online.  Tries Open Library (by ISBN)
+    then Google Books (by title/author).  Returns True on success.
+    """
+    if fetch_cover_openlibrary(isbn, output_path):
+        print("  Cover: found via Open Library (ISBN)")
+        return True
+    if fetch_cover_google_books(title, author, output_path):
+        print("  Cover: found via Google Books")
+        return True
+    return False
+
+
 # ── resolving the best cover image ────────────────────────────────────────────
 
 
-def resolve_cover(directory, mp3_files, bookinfo_cover_src=None):
+def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
+                  title=None, author=None, isbn=None):
     """
     Return a Path to the best cover image we can find, or None.
 
@@ -473,6 +550,7 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None):
       1. The file referenced in bookinfo.html (if present and exists).
       2. The largest .jpg/.png in the directory.
       3. An image extracted from the first MP3 that has one embedded.
+      4. Online lookup (Open Library by ISBN, then Google Books by title/author).
     """
     directory = Path(directory)
 
@@ -497,6 +575,12 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None):
             out = directory / ".cover_extracted.jpg"
             if extract_cover_from_mp3(mp3, out):
                 return out
+
+    # 4 – online lookup as last resort
+    if title:
+        out = directory / ".cover_online.jpg"
+        if fetch_cover_online(title, author or "", out, isbn=isbn):
+            return out
 
     return None
 
@@ -634,7 +718,11 @@ def process_zip(zip_path, output_dir, temp_base):
             chapters.append({"title": t, "duration_ms": dur})
 
         # ── cover ──
-        cover_path = resolve_cover(extract_dir, mp3_files, cover_src)
+        isbn = ffprobe_tags(mp3_files[0]).get("ISBN", "") if mp3_files else ""
+        cover_path = resolve_cover(
+            extract_dir, mp3_files, cover_src,
+            title=title, author=author, isbn=isbn,
+        )
 
         # ── convert ──
         metadata = {"title": title, "author": author, "reader": reader}
@@ -736,11 +824,15 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
             chapters.append({"title": t, "duration_ms": dur})
 
         # ── cover ──
-        cover_path = resolve_cover(folder_path, mp3_files)
+        tags = ffprobe_tags(mp3_files[0])
+        isbn = tags.get("ISBN", "")
+        cover_path = resolve_cover(
+            folder_path, mp3_files,
+            title=title, author=author, isbn=isbn,
+        )
 
         # ── narrator from tags ──
         reader = ""
-        tags = ffprobe_tags(mp3_files[0])
         comment = tags.get("comment", "")
         m = re.search(r"[Čč]te:\s*(.*)", comment)
         if m:
