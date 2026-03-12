@@ -5,6 +5,8 @@ with chapters, metadata, and cover art.
 
 Usage:
     python3 convert_to_m4b.py [directory]
+    python3 convert_to_m4b.py --dry-run /path/to/audiobooks
+    python3 convert_to_m4b.py -j 4 /path/to/audiobooks
 
 Scans <directory> (default: current dir) for audiobooks stored as:
   - ZIP archives containing MP3s (with optional bookinfo.html / playlist.pls)
@@ -16,6 +18,7 @@ Outputs to <directory>/m4b/ with filenames like "Author - Title.m4b".
 Reentrant: books whose output .m4b already exists are skipped.
 
 Requirements: ffmpeg, ffprobe (both on PATH)
+Optional:     tqdm (pip install tqdm) for progress bars
 """
 
 import argparse
@@ -25,7 +28,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import urllib.parse
 import urllib.request
 import zipfile
@@ -33,11 +35,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from html.parser import HTMLParser
 from pathlib import Path
 
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
 # ── constants ────────────────────────────────────────────────────────────────
 
 AAC_BITRATE = "128k"
 OUTPUT_SUBDIR = "m4b"
 TEMP_SUBDIR = ".tmp"
+
+# ── tqdm-safe logging ────────────────────────────────────────────────────────
+
+_progress_bar = None
+
+
+def log(msg):
+    """Print a message. Uses tqdm.write() when a progress bar is active."""
+    if _progress_bar is not None:
+        _progress_bar.write(msg)
+    else:
+        print(msg)
 
 
 # ── low-level helpers ────────────────────────────────────────────────────────
@@ -132,6 +151,16 @@ def format_duration(ms):
     if h:
         return f"{h}h {m:02d}m"
     return f"{m}m {s:02d}s"
+
+
+def normalise_author(raw):
+    """'Flanagan, John' → 'John Flanagan'; already-normal names pass through."""
+    raw = raw.strip()
+    if "," in raw:
+        parts = [p.strip() for p in raw.split(",", 1)]
+        if len(parts) == 2 and parts[1]:
+            return f"{parts[1]} {parts[0]}"
+    return raw
 
 
 # ── playlist parsing ─────────────────────────────────────────────────────────
@@ -424,13 +453,13 @@ def convert_to_m4b(mp3_files, chapters, metadata, cover_path, output_path, temp_
     ])
 
     total_ms = sum(ch["duration_ms"] for ch in chapters)
-    print(f"  Encoding {len(mp3_files)} tracks ({format_duration(total_ms)}) ...")
+    log(f"  Encoding {len(mp3_files)} tracks ({format_duration(total_ms)}) ...")
 
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        print("  ERROR: ffmpeg failed:")
+        log("  ERROR: ffmpeg failed:")
         for line in r.stderr.strip().splitlines()[-15:]:
-            print(f"    {line}")
+            log(f"    {line}")
         return False
     return True
 
@@ -464,9 +493,143 @@ def discover_books(base_dir):
     return books
 
 
+# ── planning (cheap metadata extraction for the pre-run summary) ─────────────
+
+
+def plan_zip_book(zip_path, output_dir):
+    """
+    Cheaply determine output name, track count, and skip/convert status
+    for a ZIP audiobook.  Only reads metadata from the zip — no extraction.
+    """
+    author = ""
+    title = ""
+    n_tracks = 0
+    source_label = "ZIP"
+
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = zf.namelist()
+            n_tracks = sum(1 for n in names if n.lower().endswith(".mp3"))
+
+            for n in names:
+                if os.path.basename(n).lower() == "bookinfo.html":
+                    html = zf.read(n).decode("utf-8", errors="replace")
+                    info = parse_bookinfo(html)
+                    author = info.author
+                    title = info.title
+                    break
+    except Exception:
+        pass
+
+    if not title:
+        title = zip_path.stem.replace("-", " ").strip().title()
+    author = normalise_author(author) if author else "Unknown"
+
+    output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+    output_path = output_dir / output_name
+    status = "skip" if output_path.exists() else "convert"
+
+    return {
+        "output_name": output_name,
+        "status": status,
+        "n_tracks": n_tracks,
+        "source_label": source_label,
+    }
+
+
+def plan_folder_book(folder_path, base_dir, output_dir):
+    """
+    Cheaply determine output name, track count, and skip/convert status
+    for a folder audiobook.
+    """
+    rel = folder_path.relative_to(base_dir)
+    parts = list(rel.parts)
+    mp3_files = sorted(folder_path.glob("*.mp3"))
+    n_tracks = len(mp3_files)
+
+    author = ""
+    title = ""
+
+    if len(parts) >= 3:
+        author = parts[0]
+        series = strip_number_prefix(parts[1])
+        book = strip_number_prefix(parts[2])
+        num = extract_number_prefix(parts[2])
+        if num is not None:
+            title = f"{series} {num:02d} - {book}"
+        else:
+            title = f"{series} - {book}"
+    elif len(parts) == 2:
+        author = parts[0]
+        title = strip_number_prefix(parts[1])
+    elif len(parts) == 1:
+        title = strip_number_prefix(parts[0]) or parts[0]
+    else:
+        title = folder_path.name
+
+    if not author and mp3_files:
+        tags = ffprobe_tags(mp3_files[0])
+        author = normalise_author(
+            tags.get("artist") or tags.get("album_artist") or ""
+        )
+    if not author:
+        author = "Unknown"
+
+    output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+    output_path = output_dir / output_name
+    status = "skip" if output_path.exists() else "convert"
+
+    return {
+        "output_name": output_name,
+        "status": status,
+        "n_tracks": n_tracks,
+        "source_label": str(rel),
+    }
+
+
+def build_plan(books, base_dir, output_dir):
+    """
+    Return a list of plan dicts for all discovered books.
+    Each dict has: btype, bpath, output_name, status, n_tracks, source_label.
+    """
+    plan = []
+    for btype, bpath in books:
+        if btype == "zip":
+            info = plan_zip_book(bpath, output_dir)
+        else:
+            info = plan_folder_book(bpath, base_dir, output_dir)
+        info["btype"] = btype
+        info["bpath"] = bpath
+        plan.append(info)
+    return plan
+
+
+def display_plan(plan):
+    """Print a formatted plan table."""
+    if not plan:
+        print("Nothing found.")
+        return
+
+    # compute column widths
+    max_name = max(len(p["output_name"]) for p in plan)
+    max_name = min(max_name, 72)  # cap for very long names
+
+    print(f"\nPlan ({len(plan)} books):\n")
+    for p in plan:
+        status_tag = "SKIP   " if p["status"] == "skip" else "CONVERT"
+        name = p["output_name"]
+        if len(name) > max_name:
+            name = name[:max_name - 1] + "\u2026"
+        tracks = f"{p['n_tracks']} tracks"
+        print(f"  {status_tag}  {name:<{max_name}}  {tracks:>10}")
+
+    n_convert = sum(1 for p in plan if p["status"] == "convert")
+    n_skip = sum(1 for p in plan if p["status"] == "skip")
+    print(f"\n  {n_convert} to convert, {n_skip} already done\n")
+
+
 # ── online cover lookup ───────────────────────────────────────────────────────
 
-# Minimum image size in bytes to accept (rejects 1x1 pixel placeholders etc.)
 _MIN_COVER_BYTES = 1000
 _HTTP_TIMEOUT = 15
 
@@ -530,10 +693,10 @@ def fetch_cover_online(title, author, output_path, isbn=None):
     then Google Books (by title/author).  Returns True on success.
     """
     if fetch_cover_openlibrary(isbn, output_path):
-        print("  Cover: found via Open Library (ISBN)")
+        log("  Cover: found via Open Library (ISBN)")
         return True
     if fetch_cover_google_books(title, author, output_path):
-        print("  Cover: found via Google Books")
+        log("  Cover: found via Google Books")
         return True
     return False
 
@@ -559,7 +722,6 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
         p = directory / bookinfo_cover_src
         if p.exists():
             return p
-        # maybe just the name without path prefix
         candidates = list(directory.rglob(Path(bookinfo_cover_src).name))
         if candidates:
             return candidates[0]
@@ -570,7 +732,7 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
         return img
 
     # 3 – extract from the first MP3 with an embedded cover
-    for mp3 in mp3_files[:3]:  # check a few in case the first has none
+    for mp3 in mp3_files[:3]:
         if file_has_cover_stream(mp3):
             out = directory / ".cover_extracted.jpg"
             if extract_cover_from_mp3(mp3, out):
@@ -585,25 +747,11 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
     return None
 
 
-# ── normalise author name ─────────────────────────────────────────────────────
-
-
-def normalise_author(raw):
-    """'Flanagan, John' → 'John Flanagan'; already-normal names pass through."""
-    raw = raw.strip()
-    if "," in raw:
-        parts = [p.strip() for p in raw.split(",", 1)]
-        if len(parts) == 2 and parts[1]:
-            return f"{parts[1]} {parts[0]}"
-    return raw
-
-
 # ── process a ZIP audiobook ──────────────────────────────────────────────────
 
 
 def process_zip(zip_path, output_dir, temp_base):
-    print(f"\n{'=' * 60}")
-    print(f"ZIP: {zip_path.name}")
+    log(f"  ZIP: {zip_path.name}")
 
     temp_dir = temp_base / zip_path.stem
     extract_dir = temp_dir / "data"
@@ -645,7 +793,7 @@ def process_zip(zip_path, output_dir, temp_base):
                 title = zip_path.stem.replace("-", " ").strip().title()
 
             # ── extract ──
-            print("  Extracting ...")
+            log("  Extracting ...")
             extract_dir.mkdir(parents=True, exist_ok=True)
             zf.extractall(extract_dir)
 
@@ -676,8 +824,8 @@ def process_zip(zip_path, output_dir, temp_base):
             mp3_files = all_mp3s
 
         if not mp3_files:
-            print("  WARNING: no MP3 files found — skipping")
-            return
+            log("  WARNING: no MP3 files found — skipping")
+            return "skip"
 
         # ── fallback author from tags ──
         if not author:
@@ -693,11 +841,10 @@ def process_zip(zip_path, output_dir, temp_base):
         output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
         output_path = output_dir / output_name
         if output_path.exists():
-            print(f"  SKIP (already exists): {output_name}")
-            return
+            log(f"  SKIP (already exists): {output_name}")
+            return "skip"
 
         # ── chapter titles + durations ──
-        # prefer bookinfo titles, then playlist titles, then derive heuristically
         if info and info.chapters and len(info.chapters) == len(mp3_files):
             ch_titles = [
                 re.sub(r"^\d+\s+", "", ch.get("title", "")).strip()
@@ -731,9 +878,11 @@ def process_zip(zip_path, output_dir, temp_base):
         if convert_to_m4b(mp3_files, chapters, metadata, cover_path, tmp_out, temp_dir):
             shutil.move(str(tmp_out), str(output_path))
             size_mb = output_path.stat().st_size / (1024 * 1024)
-            print(f"  DONE: {output_name} ({size_mb:.1f} MB)")
+            log(f"  DONE: {output_name} ({size_mb:.1f} MB)")
+            return "done"
         else:
-            print(f"  FAILED: {output_name}")
+            log(f"  FAILED: {output_name}")
+            return "failed"
 
     finally:
         if temp_dir.exists():
@@ -745,14 +894,13 @@ def process_zip(zip_path, output_dir, temp_base):
 
 def process_folder(folder_path, base_dir, output_dir, temp_base):
     rel = folder_path.relative_to(base_dir)
-    print(f"\n{'=' * 60}")
-    print(f"Folder: {rel}")
+    log(f"  Folder: {rel}")
 
     parts = list(rel.parts)
     mp3_files = sorted(folder_path.glob("*.mp3"))
     if not mp3_files:
-        print("  WARNING: no MP3 files — skipping")
-        return
+        log("  WARNING: no MP3 files — skipping")
+        return "skip"
 
     # ── check for a playlist and reorder if found ──
     playlist_entries = find_and_parse_playlist(folder_path)
@@ -769,7 +917,6 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
     title = ""
 
     if len(parts) >= 3:
-        # Author / Series / Book
         author = parts[0]
         series = strip_number_prefix(parts[1])
         book = strip_number_prefix(parts[2])
@@ -786,7 +933,6 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
     else:
         title = folder_path.name
 
-    # fallback author from tags
     if not author:
         tags = ffprobe_tags(mp3_files[0])
         author = normalise_author(
@@ -798,8 +944,8 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
     output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
     output_path = output_dir / output_name
     if output_path.exists():
-        print(f"  SKIP (already exists): {output_name}")
-        return
+        log(f"  SKIP (already exists): {output_name}")
+        return "skip"
 
     temp_dir = temp_base / sanitize_filename(str(rel).replace(os.sep, "_"))
     temp_dir.mkdir(parents=True, exist_ok=True)
@@ -808,7 +954,6 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
         # ── chapter titles ──
         if playlist_entries and len(playlist_entries) == len(mp3_files):
             ch_titles_raw = [e.get("title", "").strip() for e in playlist_entries]
-            # only use if they carry meaningful info
             unique = set(re.sub(r"^\d+\s*", "", t).strip() for t in ch_titles_raw if t)
             if len(unique) > 1:
                 ch_titles = [re.sub(r"^\d+\s+", "", t).strip() for t in ch_titles_raw]
@@ -845,9 +990,11 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
         if convert_to_m4b(mp3_files, chapters, metadata, cover_path, tmp_out, temp_dir):
             shutil.move(str(tmp_out), str(output_path))
             size_mb = output_path.stat().st_size / (1024 * 1024)
-            print(f"  DONE: {output_name} ({size_mb:.1f} MB)")
+            log(f"  DONE: {output_name} ({size_mb:.1f} MB)")
+            return "done"
         else:
-            print(f"  FAILED: {output_name}")
+            log(f"  FAILED: {output_name}")
+            return "failed"
 
     finally:
         if temp_dir.exists():
@@ -858,29 +1005,36 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
 
 
 def _process_one(btype, bpath, base_dir, output_dir, temp_base):
-    """Process a single book. Designed to be called from a thread pool."""
+    """Process a single book. Returns 'done', 'skip', or 'failed'."""
     try:
         if btype == "zip":
-            process_zip(bpath, output_dir, temp_base)
+            return process_zip(bpath, output_dir, temp_base)
         else:
-            process_folder(bpath, base_dir, output_dir, temp_base)
+            return process_folder(bpath, base_dir, output_dir, temp_base)
     except Exception as exc:
-        print(f"  ERROR ({bpath}): {exc}")
+        log(f"  ERROR ({bpath}): {exc}")
+        return "failed"
 
 
 def main():
-    parser = argparse.ArgumentParser(
+    global _progress_bar
+
+    ap = argparse.ArgumentParser(
         description="Convert audiobook MP3 collections to M4B files."
     )
-    parser.add_argument(
+    ap.add_argument(
         "directory", nargs="?", default=".",
         help="Root directory to scan (default: current dir)",
     )
-    parser.add_argument(
+    ap.add_argument(
         "-j", "--jobs", type=int, default=1,
         help="Number of books to process in parallel (default: 1)",
     )
-    args = parser.parse_args()
+    ap.add_argument(
+        "-n", "--dry-run", action="store_true",
+        help="Show what would be converted, then exit",
+    )
+    args = ap.parse_args()
 
     base_dir = Path(args.directory).resolve()
     output_dir = base_dir / OUTPUT_SUBDIR
@@ -895,24 +1049,75 @@ def main():
 
     print(f"Source:  {base_dir}")
     print(f"Output:  {output_dir}")
-    print(f"Jobs:    {jobs}")
+    if not args.dry_run:
+        print(f"Jobs:    {jobs}")
 
+    # ── discover ──
     books = discover_books(base_dir)
-    n_zip = sum(1 for t, _ in books if t == "zip")
-    n_dir = sum(1 for t, _ in books if t == "folder")
-    print(f"Found {n_zip} zip archive(s), {n_dir} folder book(s)  ({len(books)} total)")
+    if not books:
+        print("\nNo audiobooks found.")
+        return
 
-    if jobs == 1:
-        for btype, bpath in books:
-            _process_one(btype, bpath, base_dir, output_dir, temp_base)
+    # ── plan ──
+    print("\nScanning metadata ...")
+    plan = build_plan(books, base_dir, output_dir)
+    display_plan(plan)
+
+    to_convert = [p for p in plan if p["status"] == "convert"]
+
+    if args.dry_run:
+        return
+
+    if not to_convert:
+        print("Nothing to do.")
+        return
+
+    # ── process ──
+    results = {"done": 0, "skip": 0, "failed": 0}
+
+    if tqdm:
+        bar = tqdm(
+            total=len(to_convert),
+            desc="Converting",
+            unit="book",
+            dynamic_ncols=True,
+        )
+        _progress_bar = bar
     else:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futures = [
-                pool.submit(_process_one, btype, bpath, base_dir, output_dir, temp_base)
-                for btype, bpath in books
-            ]
-            for f in as_completed(futures):
-                f.result()  # surfaces any uncaught exceptions
+        bar = None
+        _progress_bar = None
+
+    try:
+        if jobs == 1:
+            for p in to_convert:
+                if bar:
+                    bar.set_postfix_str(p["output_name"][:40], refresh=True)
+                result = _process_one(
+                    p["btype"], p["bpath"], base_dir, output_dir, temp_base,
+                )
+                results[result or "failed"] += 1
+                if bar:
+                    bar.update(1)
+        else:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                futures = {}
+                for p in to_convert:
+                    f = pool.submit(
+                        _process_one,
+                        p["btype"], p["bpath"], base_dir, output_dir, temp_base,
+                    )
+                    futures[f] = p
+                for f in as_completed(futures):
+                    p = futures[f]
+                    result = f.result()
+                    results[result or "failed"] += 1
+                    if bar:
+                        bar.set_postfix_str(p["output_name"][:40], refresh=False)
+                        bar.update(1)
+    finally:
+        if bar:
+            bar.close()
+        _progress_bar = None
 
     # clean up temp root if empty
     if temp_base.exists():
@@ -921,8 +1126,19 @@ def main():
         except OSError:
             pass
 
+    # ── summary ──
     print(f"\n{'=' * 60}")
-    print("All done.")
+    n_skip_plan = sum(1 for p in plan if p["status"] == "skip")
+    parts = []
+    if results["done"]:
+        parts.append(f"{results['done']} converted")
+    if n_skip_plan:
+        parts.append(f"{n_skip_plan} already existed")
+    if results["skip"]:
+        parts.append(f"{results['skip']} skipped at runtime")
+    if results["failed"]:
+        parts.append(f"{results['failed']} FAILED")
+    print(f"Done: {', '.join(parts)}.")
 
 
 if __name__ == "__main__":
