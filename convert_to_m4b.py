@@ -483,20 +483,27 @@ def _call_claude(prompt, api_key):
     return ""
 
 
-def ai_extract_metadata(tags, folder_name="", parent_name="",
-                         filenames=None, api_key=None):
+def _ai_judge_metadata(candidates, tags, folder_name="", parent_name="",
+                        filenames=None, api_key=None):
     """
-    Use Claude to determine the book **author** and **title** from the
-    available signals.  Returns ``(author, title)`` or ``("", "")`` on
-    failure, so the caller can fall back to heuristic extraction.
+    Feed all collected metadata candidates to Claude and let it pick
+    the best author and title.  Returns ``(author, title)`` or
+    ``("", "")`` on failure.
     """
     if not api_key:
         return "", ""
 
-    # Build a concise context block with everything we know.
+    # Build context: raw signals + heuristic candidates
     parts = []
+
+    # 1 — heuristic candidates
+    if candidates:
+        parts.append("Heuristic candidates (our best guesses so far):\n" +
+                      "\n".join(f"  {k}: {v}" for k, v in candidates.items()
+                                if v))
+
+    # 2 — raw tags
     if tags:
-        # Only include useful tags, skip binary / internal ones.
         useful = {k: v for k, v in tags.items()
                   if k.lower() in (
                       "title", "album", "artist", "album_artist", "composer",
@@ -504,8 +511,10 @@ def ai_extract_metadata(tags, folder_name="", parent_name="",
                       "TSOC", "artist-sort", "TSO2",
                   ) and v and v.strip()}
         if useful:
-            parts.append("Audio file tags:\n" + "\n".join(
+            parts.append("Raw audio file tags:\n" + "\n".join(
                 f"  {k}: {v}" for k, v in useful.items()))
+
+    # 3 — folder/file context
     if folder_name:
         parts.append(f"Folder name (leaf): {folder_name}")
     if parent_name:
@@ -522,29 +531,30 @@ def ai_extract_metadata(tags, folder_name="", parent_name="",
 
     context = "\n".join(parts)
 
-    prompt = f"""You are extracting metadata from a Czech audiobook. Given the information below, determine the book's AUTHOR (the person who wrote the book) and TITLE.
+    prompt = f"""You are reviewing metadata for a Czech audiobook. Below you have raw signals (audio file tags, folder names, filenames) AND heuristic candidates that our code already extracted.
 
-IMPORTANT:
-- The "artist" tag is often the NARRATOR (the person reading aloud), not the author. Use "composer", "album", folder names, and other clues to distinguish.
-- Folder names on the server often follow "Author, Last - Title" or "Author__Title" patterns.
-- Tags may have encoding issues (mojibake) — try to infer the correct text.
-- The album tag is usually the book title.
-- Return the author as "Firstname Lastname" (not "Lastname, Firstname").
-- KEEP THE TITLE IN ITS ORIGINAL LANGUAGE (usually Czech). Do NOT translate titles to English.
-- Use proper Czech diacritics in titles (e.g. "Mechanický pomeranč" not "Mechanicky pomeranc").
+Your job: decide the correct AUTHOR (the writer of the book) and TITLE. Use ONLY the information below — do NOT substitute names from your world knowledge.
+
+Rules:
+- The heuristic candidates are often correct — confirm or fix them.
+- In audiobooks, "artist" and "album_artist" are OFTEN the narrator, not the author. "composer" is often the author. But not always.
+- The "album" tag is usually the book title. It sometimes contains "Author: Title".
+- Folder names often follow "Last, First - Title" or "Author__Title" patterns.
+- If only one person name appears across all fields, that person is the author.
+- Fix obvious Czech diacritics (e.g. "Mechanicky pomeranc" → "Mechanický pomeranč").
+- Keep titles in Czech. Do NOT translate to English.
+- Return author as "Firstname Lastname" (not "Lastname, Firstname").
 
 {context}
 
-Respond with ONLY a JSON object, no other text:
+Respond with ONLY a JSON object:
 {{"author": "...", "title": "..."}}"""
 
     text = _call_claude(prompt, api_key)
     if not text:
         return "", ""
 
-    # Parse the JSON from the response — be lenient.
     try:
-        # Strip markdown code fences if present
         text = text.strip()
         if text.startswith("```"):
             text = re.sub(r"^```\w*\n?", "", text)
@@ -560,25 +570,41 @@ Respond with ONLY a JSON object, no other text:
 def smart_extract_metadata(tags, folder_name="", parent_name="",
                            filenames=None):
     """
-    Extract (author, title) using AI when available, falling back to
-    heuristic extraction.
+    Extract (author, title) by running heuristics first, then optionally
+    passing all collected signals to Claude for final judgement.
     """
-    # Try AI first
+    # Step 1: Run heuristics — always
+    h_author, h_title = extract_book_metadata(tags, folder_name=folder_name)
+    if not h_author and parent_name and "," in parent_name:
+        h_author = normalise_author(parent_name)
+
+    # Also parse folder name for an alternative candidate
+    fn_author, fn_title = parse_folder_name(folder_name) if folder_name else ("", "")
+    pn_author = normalise_author(parent_name) if parent_name and "," in parent_name else ""
+
+    # Step 2: If AI is available, let it judge
     if _claude_api_key:
-        ai_author, ai_title = ai_extract_metadata(
-            tags, folder_name=folder_name, parent_name=parent_name,
-            filenames=filenames, api_key=_claude_api_key,
+        candidates = {}
+        if h_author:
+            candidates["heuristic_author"] = h_author
+        if h_title:
+            candidates["heuristic_title"] = h_title
+        if fn_author and fn_author != h_author:
+            candidates["folder_name_author"] = fn_author
+        if fn_title and fn_title != h_title:
+            candidates["folder_name_title"] = fn_title
+        if pn_author and pn_author != h_author:
+            candidates["parent_folder_author"] = pn_author
+
+        ai_author, ai_title = _ai_judge_metadata(
+            candidates, tags, folder_name=folder_name,
+            parent_name=parent_name, filenames=filenames,
+            api_key=_claude_api_key,
         )
         if ai_author or ai_title:
-            return ai_author, ai_title
+            return ai_author or h_author, ai_title or h_title
 
-    # Heuristic fallback
-    author, title = extract_book_metadata(tags, folder_name=folder_name)
-    if not author and parent_name:
-        # Try parent folder as author (same logic as _author_from_parent)
-        if "," in parent_name:
-            author = normalise_author(parent_name)
-    return author, title
+    return h_author, h_title
 
 
 # ── playlist parsing ─────────────────────────────────────────────────────────
