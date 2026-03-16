@@ -1075,34 +1075,6 @@ def plan_folder_book(folder_path, base_dir, output_dir):
     }
 
 
-def _deduplicate_plan_names(plan, output_dir):
-    """
-    Ensure every ``output_name`` in *plan* is unique — both within the plan
-    and against files already on disk.  Collisions get a ``-1``, ``-2``, …
-    suffix appended before the ``.m4b`` extension.
-    """
-    used = set()
-    # Pre-seed with files already in output_dir so we never collide with them
-    if output_dir.is_dir():
-        for f in output_dir.iterdir():
-            if f.is_file():
-                used.add(f.name)
-
-    for p in plan:
-        name = p["output_name"]
-        if name not in used:
-            used.add(name)
-            continue
-        base = name.removesuffix(".m4b")
-        n = 1
-        while f"{base}-{n}.m4b" in used:
-            n += 1
-        p["output_name"] = f"{base}-{n}.m4b"
-        # Re-evaluate status: the new name might not exist on disk
-        p["status"] = "skip" if (output_dir / p["output_name"]).exists() else "convert"
-        used.add(p["output_name"])
-
-
 def build_plan(books, base_dir, output_dir):
     """
     Return a list of plan dicts for all discovered books.
@@ -1117,7 +1089,6 @@ def build_plan(books, base_dir, output_dir):
         info["btype"] = btype
         info["bpath"] = bpath
         plan.append(info)
-    _deduplicate_plan_names(plan, output_dir)
     return plan
 
 
@@ -1267,7 +1238,7 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
 # ── process a ZIP audiobook ──────────────────────────────────────────────────
 
 
-def process_zip(zip_path, output_dir, temp_base, planned_output_name=None):
+def process_zip(zip_path, output_dir, temp_base):
     log(f"  ZIP: {zip_path.name}")
 
     temp_dir = temp_base / zip_path.stem
@@ -1360,10 +1331,7 @@ def process_zip(zip_path, output_dir, temp_base, planned_output_name=None):
         else:
             author = normalise_author(author)
 
-        if planned_output_name:
-            output_name = planned_output_name
-        else:
-            output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+        output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
         output_path = output_dir / output_name
         if output_path.exists():
             log(f"  SKIP (already exists): {output_name}")
@@ -1417,7 +1385,7 @@ def process_zip(zip_path, output_dir, temp_base, planned_output_name=None):
 # ── process a folder audiobook ────────────────────────────────────────────────
 
 
-def process_folder(folder_path, base_dir, output_dir, temp_base, planned_output_name=None):
+def process_folder(folder_path, base_dir, output_dir, temp_base):
     rel = folder_path.relative_to(base_dir)
     log(f"  Folder: {rel}")
 
@@ -1451,10 +1419,7 @@ def process_folder(folder_path, base_dir, output_dir, temp_base, planned_output_
     if not title:
         title = folder_name
 
-    if planned_output_name:
-        output_name = planned_output_name
-    else:
-        output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+    output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
     output_path = output_dir / output_name
     if output_path.exists():
         log(f"  SKIP (already exists): {output_name}")
@@ -1516,15 +1481,13 @@ def process_folder(folder_path, base_dir, output_dir, temp_base, planned_output_
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
-def _process_one(btype, bpath, base_dir, output_dir, temp_base,
-                  planned_output_name=None):
+def _process_one(btype, bpath, base_dir, output_dir, temp_base):
     """Process a single book. Returns 'done', 'skip', or 'failed'."""
     try:
         if btype == "zip":
-            return process_zip(bpath, output_dir, temp_base, planned_output_name)
+            return process_zip(bpath, output_dir, temp_base)
         else:
-            return process_folder(bpath, base_dir, output_dir, temp_base,
-                                  planned_output_name)
+            return process_folder(bpath, base_dir, output_dir, temp_base)
     except Exception as exc:
         log(f"  ERROR ({bpath}): {exc}")
         return "failed"
@@ -1629,7 +1592,6 @@ def main():
                     bar.set_postfix_str(p["output_name"][:40], refresh=True)
                 result = _process_one(
                     p["btype"], p["bpath"], base_dir, output_dir, temp_base,
-                    p["output_name"],
                 )
                 results[result or "failed"] += 1
                 if bar:
@@ -1641,7 +1603,6 @@ def main():
                     f = pool.submit(
                         _process_one,
                         p["btype"], p["bpath"], base_dir, output_dir, temp_base,
-                        p["output_name"],
                     )
                     futures[f] = p
                 for f in as_completed(futures):
