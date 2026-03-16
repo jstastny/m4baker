@@ -183,6 +183,28 @@ def sanitize_filename(name):
     return name.strip(". ")
 
 
+def safe_move(src, dst):
+    """
+    Move *src* to *dst* without overwriting.  If *dst* already exists,
+    append ``-1``, ``-2``, … before the suffix until a free name is found.
+    Returns the actual Path the file was moved to.
+    """
+    dst = Path(dst)
+    if not dst.exists():
+        shutil.move(str(src), str(dst))
+        return dst
+    base = dst.stem
+    ext = dst.suffix
+    parent = dst.parent
+    n = 1
+    while True:
+        candidate = parent / f"{base}-{n}{ext}"
+        if not candidate.exists():
+            shutil.move(str(src), str(candidate))
+            return candidate
+        n += 1
+
+
 def strip_number_prefix(name):
     """'13. Foo' → 'Foo',  '2, Bar' → 'Bar'."""
     return re.sub(r"^\d+[.,]\s*", "", name).strip()
@@ -1053,6 +1075,34 @@ def plan_folder_book(folder_path, base_dir, output_dir):
     }
 
 
+def _deduplicate_plan_names(plan, output_dir):
+    """
+    Ensure every ``output_name`` in *plan* is unique — both within the plan
+    and against files already on disk.  Collisions get a ``-1``, ``-2``, …
+    suffix appended before the ``.m4b`` extension.
+    """
+    used = set()
+    # Pre-seed with files already in output_dir so we never collide with them
+    if output_dir.is_dir():
+        for f in output_dir.iterdir():
+            if f.is_file():
+                used.add(f.name)
+
+    for p in plan:
+        name = p["output_name"]
+        if name not in used:
+            used.add(name)
+            continue
+        base = name.removesuffix(".m4b")
+        n = 1
+        while f"{base}-{n}.m4b" in used:
+            n += 1
+        p["output_name"] = f"{base}-{n}.m4b"
+        # Re-evaluate status: the new name might not exist on disk
+        p["status"] = "skip" if (output_dir / p["output_name"]).exists() else "convert"
+        used.add(p["output_name"])
+
+
 def build_plan(books, base_dir, output_dir):
     """
     Return a list of plan dicts for all discovered books.
@@ -1067,6 +1117,7 @@ def build_plan(books, base_dir, output_dir):
         info["btype"] = btype
         info["bpath"] = bpath
         plan.append(info)
+    _deduplicate_plan_names(plan, output_dir)
     return plan
 
 
@@ -1216,7 +1267,7 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
 # ── process a ZIP audiobook ──────────────────────────────────────────────────
 
 
-def process_zip(zip_path, output_dir, temp_base):
+def process_zip(zip_path, output_dir, temp_base, planned_output_name=None):
     log(f"  ZIP: {zip_path.name}")
 
     temp_dir = temp_base / zip_path.stem
@@ -1309,7 +1360,10 @@ def process_zip(zip_path, output_dir, temp_base):
         else:
             author = normalise_author(author)
 
-        output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+        if planned_output_name:
+            output_name = planned_output_name
+        else:
+            output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
         output_path = output_dir / output_name
         if output_path.exists():
             log(f"  SKIP (already exists): {output_name}")
@@ -1347,9 +1401,9 @@ def process_zip(zip_path, output_dir, temp_base):
         output_dir.mkdir(parents=True, exist_ok=True)
         tmp_out = temp_dir / "output.m4b"
         if convert_to_m4b(mp3_files, chapters, metadata, cover_path, tmp_out, temp_dir):
-            shutil.move(str(tmp_out), str(output_path))
-            size_mb = output_path.stat().st_size / (1024 * 1024)
-            log(f"  DONE: {output_name} ({size_mb:.1f} MB)")
+            actual = safe_move(tmp_out, output_path)
+            size_mb = actual.stat().st_size / (1024 * 1024)
+            log(f"  DONE: {actual.name} ({size_mb:.1f} MB)")
             return "done"
         else:
             log(f"  FAILED: {output_name}")
@@ -1363,7 +1417,7 @@ def process_zip(zip_path, output_dir, temp_base):
 # ── process a folder audiobook ────────────────────────────────────────────────
 
 
-def process_folder(folder_path, base_dir, output_dir, temp_base):
+def process_folder(folder_path, base_dir, output_dir, temp_base, planned_output_name=None):
     rel = folder_path.relative_to(base_dir)
     log(f"  Folder: {rel}")
 
@@ -1397,7 +1451,10 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
     if not title:
         title = folder_name
 
-    output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+    if planned_output_name:
+        output_name = planned_output_name
+    else:
+        output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
     output_path = output_dir / output_name
     if output_path.exists():
         log(f"  SKIP (already exists): {output_name}")
@@ -1443,9 +1500,9 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
         output_dir.mkdir(parents=True, exist_ok=True)
         tmp_out = temp_dir / "output.m4b"
         if convert_to_m4b(mp3_files, chapters, metadata, cover_path, tmp_out, temp_dir):
-            shutil.move(str(tmp_out), str(output_path))
-            size_mb = output_path.stat().st_size / (1024 * 1024)
-            log(f"  DONE: {output_name} ({size_mb:.1f} MB)")
+            actual = safe_move(tmp_out, output_path)
+            size_mb = actual.stat().st_size / (1024 * 1024)
+            log(f"  DONE: {actual.name} ({size_mb:.1f} MB)")
             return "done"
         else:
             log(f"  FAILED: {output_name}")
@@ -1459,13 +1516,15 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
-def _process_one(btype, bpath, base_dir, output_dir, temp_base):
+def _process_one(btype, bpath, base_dir, output_dir, temp_base,
+                  planned_output_name=None):
     """Process a single book. Returns 'done', 'skip', or 'failed'."""
     try:
         if btype == "zip":
-            return process_zip(bpath, output_dir, temp_base)
+            return process_zip(bpath, output_dir, temp_base, planned_output_name)
         else:
-            return process_folder(bpath, base_dir, output_dir, temp_base)
+            return process_folder(bpath, base_dir, output_dir, temp_base,
+                                  planned_output_name)
     except Exception as exc:
         log(f"  ERROR ({bpath}): {exc}")
         return "failed"
@@ -1570,6 +1629,7 @@ def main():
                     bar.set_postfix_str(p["output_name"][:40], refresh=True)
                 result = _process_one(
                     p["btype"], p["bpath"], base_dir, output_dir, temp_base,
+                    p["output_name"],
                 )
                 results[result or "failed"] += 1
                 if bar:
@@ -1581,6 +1641,7 @@ def main():
                     f = pool.submit(
                         _process_one,
                         p["btype"], p["bpath"], base_dir, output_dir, temp_base,
+                        p["output_name"],
                     )
                     futures[f] = p
                 for f in as_completed(futures):
