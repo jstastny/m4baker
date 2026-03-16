@@ -965,8 +965,9 @@ def discover_books(base_dir):
 
 def plan_zip_book(zip_path, output_dir):
     """
-    Cheaply determine output name, track count, and skip/convert status
-    for a ZIP audiobook.  Only reads metadata from the zip — no extraction.
+    Determine output name, track count, and skip/convert status for a ZIP
+    audiobook.  Reads bookinfo.html first; when that lacks author/title,
+    extracts one audio file to a temp location for ffprobe + AI metadata.
     """
     author = ""
     title = ""
@@ -976,7 +977,8 @@ def plan_zip_book(zip_path, output_dir):
     try:
         with zipfile.ZipFile(zip_path) as zf:
             names = zf.namelist()
-            n_tracks = sum(1 for n in names if is_audio_file(n))
+            audio_names = sorted(n for n in names if is_audio_file(n))
+            n_tracks = len(audio_names)
 
             for n in names:
                 if os.path.basename(n).lower() == "bookinfo.html":
@@ -985,6 +987,25 @@ def plan_zip_book(zip_path, output_dir):
                     author = info.author
                     title = info.title
                     break
+
+            # If bookinfo didn't provide author, probe audio tags + AI
+            if not author and audio_names:
+                import tempfile
+                first_audio = audio_names[0]
+                suffix = Path(first_audio).suffix
+                with tempfile.NamedTemporaryFile(suffix=suffix) as tmp:
+                    tmp.write(zf.read(first_audio))
+                    tmp.flush()
+                    tags = ffprobe_tags(Path(tmp.name))
+                    filenames = [os.path.basename(n) for n in audio_names]
+                    tag_author, tag_title = smart_extract_metadata(
+                        tags, folder_name=title or zip_path.stem,
+                        filenames=filenames,
+                    )
+                    if tag_author:
+                        author = tag_author
+                    if not title and tag_title:
+                        title = tag_title
     except Exception:
         pass
 
@@ -1238,7 +1259,7 @@ def resolve_cover(directory, mp3_files, bookinfo_cover_src=None,
 # ── process a ZIP audiobook ──────────────────────────────────────────────────
 
 
-def process_zip(zip_path, output_dir, temp_base):
+def process_zip(zip_path, output_dir, temp_base, planned_output_name=None):
     log(f"  ZIP: {zip_path.name}")
 
     temp_dir = temp_base / zip_path.stem
@@ -1316,22 +1337,31 @@ def process_zip(zip_path, output_dir, temp_base):
             log("  WARNING: no audio files found — skipping")
             return "skip"
 
-        # ── fallback author from tags (or AI) ──
-        if not author:
-            tags = ffprobe_tags(mp3_files[0])
-            filenames = [f.name for f in mp3_files]
-            tag_author, tag_title = smart_extract_metadata(
-                tags, folder_name=title, filenames=filenames,
-            )
-            author = tag_author
-            if not title and tag_title:
-                title = tag_title
-        if not author:
-            author = "Unknown"
+        # ── determine author + title for output name ──
+        if planned_output_name:
+            # Plan already resolved the name (incl. AI) — reuse it
+            output_name = planned_output_name
+            base = planned_output_name.removesuffix(".m4b")
+            if " - " in base:
+                author, title = base.split(" - ", 1)
+            else:
+                author = author or "Unknown"
+                title = title or base
         else:
-            author = normalise_author(author)
-
-        output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
+            if not author:
+                tags = ffprobe_tags(mp3_files[0])
+                filenames = [f.name for f in mp3_files]
+                tag_author, tag_title = smart_extract_metadata(
+                    tags, folder_name=title, filenames=filenames,
+                )
+                author = tag_author
+                if not title and tag_title:
+                    title = tag_title
+            if not author:
+                author = "Unknown"
+            else:
+                author = normalise_author(author)
+            output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
         output_path = output_dir / output_name
         if output_path.exists():
             log(f"  SKIP (already exists): {output_name}")
@@ -1385,7 +1415,7 @@ def process_zip(zip_path, output_dir, temp_base):
 # ── process a folder audiobook ────────────────────────────────────────────────
 
 
-def process_folder(folder_path, base_dir, output_dir, temp_base):
+def process_folder(folder_path, base_dir, output_dir, temp_base, planned_output_name=None):
     rel = folder_path.relative_to(base_dir)
     log(f"  Folder: {rel}")
 
@@ -1405,21 +1435,30 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
         if ordered:
             mp3_files = ordered
 
-    # ── determine author + title from tags ──
-    folder_name = strip_number_prefix(folder_path.name) or folder_path.name
-    parent_name = _parent_folder_name(folder_path, base_dir)
+    # ── determine author + title ──
     tags = ffprobe_tags(mp3_files[0])
-    filenames = [f.name for f in mp3_files]
-    author, title = smart_extract_metadata(
-        tags, folder_name=folder_name, parent_name=parent_name,
-        filenames=filenames,
-    )
-    if not author:
-        author = "Unknown"
-    if not title:
-        title = folder_name
+    if planned_output_name:
+        # Plan already ran AI — reuse its result, avoid duplicate API call
+        output_name = planned_output_name
+        base = planned_output_name.removesuffix(".m4b")
+        if " - " in base:
+            author, title = base.split(" - ", 1)
+        else:
+            author, title = "Unknown", base
+    else:
+        folder_name = strip_number_prefix(folder_path.name) or folder_path.name
+        parent_name = _parent_folder_name(folder_path, base_dir)
+        filenames = [f.name for f in mp3_files]
+        author, title = smart_extract_metadata(
+            tags, folder_name=folder_name, parent_name=parent_name,
+            filenames=filenames,
+        )
+        if not author:
+            author = "Unknown"
+        if not title:
+            title = folder_name
+        output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
 
-    output_name = sanitize_filename(f"{author} - {title}") + ".m4b"
     output_path = output_dir / output_name
     if output_path.exists():
         log(f"  SKIP (already exists): {output_name}")
@@ -1481,13 +1520,15 @@ def process_folder(folder_path, base_dir, output_dir, temp_base):
 # ── main ──────────────────────────────────────────────────────────────────────
 
 
-def _process_one(btype, bpath, base_dir, output_dir, temp_base):
+def _process_one(btype, bpath, base_dir, output_dir, temp_base,
+                  planned_output_name=None):
     """Process a single book. Returns 'done', 'skip', or 'failed'."""
     try:
         if btype == "zip":
-            return process_zip(bpath, output_dir, temp_base)
+            return process_zip(bpath, output_dir, temp_base, planned_output_name)
         else:
-            return process_folder(bpath, base_dir, output_dir, temp_base)
+            return process_folder(bpath, base_dir, output_dir, temp_base,
+                                  planned_output_name)
     except Exception as exc:
         log(f"  ERROR ({bpath}): {exc}")
         return "failed"
@@ -1592,6 +1633,7 @@ def main():
                     bar.set_postfix_str(p["output_name"][:40], refresh=True)
                 result = _process_one(
                     p["btype"], p["bpath"], base_dir, output_dir, temp_base,
+                    p["output_name"],
                 )
                 results[result or "failed"] += 1
                 if bar:
@@ -1603,6 +1645,7 @@ def main():
                     f = pool.submit(
                         _process_one,
                         p["btype"], p["bpath"], base_dir, output_dir, temp_base,
+                        p["output_name"],
                     )
                     futures[f] = p
                 for f in as_completed(futures):
